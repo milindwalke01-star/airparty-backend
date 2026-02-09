@@ -1,9 +1,8 @@
 /**
  * AirParty signaling server (WebSocket)
- * - Rooms
- * - Host/peers membership
- * - Relay messages (signaling + sync)
- * - Ping/Pong to estimate server time offset
+ * Fixes:
+ * 1) "Room not found" no longer blocks join: join can create room (temporary host until real host joins)
+ * 2) Rooms are not deleted immediately when last client leaves (grace period) to survive reconnects
  *
  * WS endpoint: /ws
  * Health endpoint: /
@@ -17,6 +16,9 @@ const PORT = process.env.PORT || 8080;
 
 // rooms: roomId -> { hostId: string, clients: Map<clientId, ws> }
 const rooms = new Map();
+
+// roomId -> timeoutId (for delayed delete)
+const roomDeleteTimers = new Map();
 
 // ws -> { id, room }
 const meta = new WeakMap();
@@ -34,23 +36,42 @@ function now() {
   return Date.now();
 }
 
-function getRoom(roomId) {
-  return rooms.get(roomId);
-}
-
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, { hostId: "", clients: new Map() });
   }
+  // if room had a pending delete, cancel it
+  if (roomDeleteTimers.has(roomId)) {
+    clearTimeout(roomDeleteTimers.get(roomId));
+    roomDeleteTimers.delete(roomId);
+  }
   return rooms.get(roomId);
+}
+
+function scheduleRoomDeleteIfEmpty(roomId) {
+  const r = rooms.get(roomId);
+  if (!r) return;
+  if (r.clients.size !== 0) return;
+
+  // Grace period: 5 minutes
+  const t = setTimeout(() => {
+    const rr = rooms.get(roomId);
+    if (rr && rr.clients.size === 0) {
+      rooms.delete(roomId);
+    }
+    roomDeleteTimers.delete(roomId);
+  }, 5 * 60 * 1000);
+
+  roomDeleteTimers.set(roomId, t);
 }
 
 function removeClientFromRoom(clientId, roomId) {
   const r = rooms.get(roomId);
   if (!r) return;
+
   r.clients.delete(clientId);
 
-  // If host left, pick another host (first remaining) or clear
+  // If host left, promote first remaining client (if any)
   if (r.hostId === clientId) {
     const first = r.clients.keys().next().value || "";
     r.hostId = first || "";
@@ -59,19 +80,27 @@ function removeClientFromRoom(clientId, roomId) {
   // Notify remaining peers
   for (const [pid, pws] of r.clients.entries()) {
     send(pws, { type: "peer_left", peerId: clientId });
+    // also tell them current host (helps UI + reconnection)
+    send(pws, { type: "host_update", hostId: r.hostId || "" });
   }
 
-  // If empty, delete room
-  if (r.clients.size === 0) rooms.delete(roomId);
+  // Don't delete instantly—allow reconnect
+  if (r.clients.size === 0) scheduleRoomDeleteIfEmpty(roomId);
 }
 
 function addClientToRoom(clientId, roomId, ws) {
   const r = ensureRoom(roomId);
+
   r.clients.set(clientId, ws);
 
   // Notify others that a peer joined
   for (const [pid, pws] of r.clients.entries()) {
     if (pid !== clientId) send(pws, { type: "peer_joined", peerId: clientId });
+  }
+
+  // Tell everyone current host
+  for (const [pid, pws] of r.clients.entries()) {
+    send(pws, { type: "host_update", hostId: r.hostId || "" });
   }
 }
 
@@ -95,7 +124,7 @@ function relay(roomId, fromId, to, payload) {
   }
 }
 
-// ---------- HTTP server (for Render health checks) ----------
+// ---------- HTTP server ----------
 const server = http.createServer((req, res) => {
   if (req.url === "/" || req.url.startsWith("/health")) {
     res.writeHead(200, { "content-type": "application/json" });
@@ -106,7 +135,7 @@ const server = http.createServer((req, res) => {
   res.end("Not found");
 });
 
-// ---------- WebSocket server (noServer: we handle upgrade) ----------
+// ---------- WebSocket server ----------
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -122,10 +151,8 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 wss.on("connection", (ws) => {
-  // Until hello arrives, client has no id/room
   meta.set(ws, { id: "", room: "" });
 
-  // Basic hello ack when client identifies
   ws.on("message", (data) => {
     const msg = safeJsonParse(data.toString());
     if (!msg || typeof msg !== "object") return;
@@ -151,7 +178,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // Must have id after hello
     if (!m.id) {
       send(ws, { type: "error", message: "Send {type:'hello', id:'...'} first" });
       return;
@@ -194,14 +220,15 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const r = getRoom(roomId);
-      if (!r) {
-        send(ws, { type: "error", message: "Room not found. Ask host to create it first." });
-        return;
-      }
-
       // leave any previous room
       if (m.room) removeClientFromRoom(m.id, m.room);
+
+      // IMPORTANT FIX: if room does not exist, create it (prevents "room not found")
+      const r = ensureRoom(roomId);
+
+      // If no host yet, temporarily set first joiner as host.
+      // When real host clicks "Create Room", hostId will update.
+      if (!r.hostId) r.hostId = m.id;
 
       m.room = roomId;
       meta.set(ws, m);
@@ -217,13 +244,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // Relay (signaling + sync)
+    // Relay
     if (msg.type === "relay") {
       const roomId = String(msg.room || m.room || "").trim();
       const to = String(msg.to || "").trim();
       const payload = msg.payload || null;
 
-      if (!roomId || !rooms.has(roomId)) {
+      if (!roomId) {
         send(ws, { type: "error", message: "Invalid room for relay" });
         return;
       }
@@ -232,21 +259,20 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      // ensure room exists (reconnect safety)
+      ensureRoom(roomId);
+
       relay(roomId, m.id, to, payload);
       return;
     }
 
-    // Unknown
     send(ws, { type: "error", message: `Unknown type: ${msg.type}` });
   });
 
   ws.on("close", () => {
     const m = meta.get(ws);
     if (!m) return;
-
-    if (m.room && m.id) {
-      removeClientFromRoom(m.id, m.room);
-    }
+    if (m.room && m.id) removeClientFromRoom(m.id, m.room);
   });
 });
 
