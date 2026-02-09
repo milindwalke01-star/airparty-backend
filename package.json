@@ -1,1 +1,16 @@
-
+{
+  "name": "airparty-backend",
+  "version": "1.0.0",
+  "description": "AirParty WebSocket signaling server for room sync + WebRTC signaling",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
